@@ -1,5 +1,8 @@
+
 streamlit>=1.35
-nba_api>=1.10
 pandas>=2.0
 numpy>=1.26
+requests>=2.31
+nba_api>=1.6
 scipy>=1.11
+altair>=5.0,<6
