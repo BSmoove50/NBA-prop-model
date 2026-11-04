@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 from scipy.stats import norm
 from nba_api.stats.static import players, teams
-from nba_api.stats.endpoints import playergamelog
+from nba_api.stats.endpoints import playergamelog, commonallplayers
 
 st.set_page_config(page_title='NBA Prop Lab',page_icon='🏀',layout='wide')
 st.title('🏀 NBA Prop Lab — Season + Last 10 + Edge')
@@ -20,12 +20,63 @@ def logs(pid,season):
     for k,parts in {'PRA':['PTS','REB','AST'],'PR':['PTS','REB'],'PA':['PTS','AST'],'RA':['REB','AST']}.items():df[k]=df[parts].sum(axis=1)
     return df.sort_values('GAME_DATE',ascending=False).reset_index(drop=True)
 
-names=sorted(players.get_active_players(),key=lambda p:p['full_name'])
-lookup={p['full_name']+' ('+str(p['id'])+')':p['id'] for p in names}
+@st.cache_data(ttl=3600,show_spinner=False)
+def season_roster():
+    # NBA.com current-season roster assignments, including team IDs.
+    df=commonallplayers.CommonAllPlayers(is_only_current_season=1,league_id='00',season=SEASON,timeout=35).get_data_frames()[0]
+    df['PERSON_ID']=pd.to_numeric(df['PERSON_ID'],errors='coerce')
+    df['TEAM_ID']=pd.to_numeric(df['TEAM_ID'],errors='coerce')
+    return df.dropna(subset=['PERSON_ID'])
+
+all_players=sorted(players.get_active_players(),key=lambda p:p['full_name'])
+team_list=sorted(teams.get_teams(),key=lambda t:t['full_name'])
+team_ids={t['full_name']:t['id'] for t in team_list}
+st.subheader('Find a player')
+team_choice=st.selectbox('Filter players by team',['All NBA teams']+list(team_ids))
+search_name=st.text_input('Search player name',placeholder='Type a first or last name, e.g. Curry')
+try:
+    roster=season_roster()
+    roster=roster[roster['ROSTERSTATUS'].astype(str).eq('1')] if 'ROSTERSTATUS' in roster.columns else roster
+    if team_choice!='All NBA teams':
+        roster=roster[roster['TEAM_ID'].eq(team_ids[team_choice])]
+    eligible=set(roster['PERSON_ID'].astype(int))
+    choices=[p for p in all_players if p['id'] in eligible]
+    # Some new players may not yet be marked active in the static list.
+    known={p['id'] for p in choices}
+    for _,r in roster.iterrows():
+        pid=int(r['PERSON_ID'])
+        if pid not in known:
+            choices.append({'id':pid,'full_name':str(r['DISPLAY_FIRST_LAST'])})
+    choices.sort(key=lambda p:p['full_name'])
+except Exception:
+    if team_choice!='All NBA teams':
+        st.error('Could not load current team rosters from NBA.com. Try again shortly; team assignments cannot be verified right now.')
+        st.stop()
+    st.warning('Current NBA team rosters unavailable; showing the active-player directory without team filtering.')
+    choices=all_players
+if search_name.strip():
+    choices=[p for p in choices if search_name.casefold().strip() in p['full_name'].casefold()]
+if not choices:
+    st.info('No matching players. Try another spelling or choose All NBA teams.')
+    st.stop()
+lookup={f"{p['full_name']} ({p['id']})":p['id'] for p in choices}
 a,b,c=st.columns([2,1,1])
-with a: selection=st.selectbox('Player',list(lookup))
+with a: selection=st.selectbox('Player',list(lookup),key='player_choice')
 with b: prop=st.selectbox('Prop',list(STATS))
 with c: opponent=st.selectbox('Upcoming opponent', ['Select opponent']+sorted(TEAM_NAMES))
+# Official NBA CDN player portrait, keyed to the NBA player ID (not name).
+selected_player_id = lookup[selection]
+selected_player_name = selection.rsplit(' (', 1)[0]
+portrait_url = f'https://cdn.nba.com/headshots/nba/latest/1040x760/{selected_player_id}.png'
+profile_photo, profile_info = st.columns([1, 3], vertical_alignment='center')
+with profile_photo:
+    try:
+        st.image(portrait_url, width=180)
+    except Exception:
+        st.caption('Player photo currently unavailable')
+with profile_info:
+    st.subheader(selected_player_name)
+    st.caption('NBA player profile • Official NBA headshot')
 line=st.number_input('Sportsbook / PrizePicks line',min_value=0.0,value=25.5,step=0.5)
 col1,col2,col3=st.columns(3)
 with col1: venue=st.selectbox('Game location',['Any','Home','Away'])
