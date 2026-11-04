@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import altair as alt
 import numpy as np
 import requests
 from datetime import datetime
@@ -102,57 +103,166 @@ for g in games:
     opponents[g["home"]]=g["away"]
     opponents[g["away"]]=g["home"]
 
-st.header("🏆 Today's Top 10 Alternate Lines by Category")
-st.caption("Ranked by actual last-10-game hit rates (including prior seasons when necessary). This may take time to load. Historical rates are not guaranteed probabilities. Player availability remains UNVERIFIED.")
+# Clickable category and alternate-line buttons on the home page
+if "selected_category" not in st.session_state:
+    st.session_state.selected_category="Points"
+if "selected_alt_line" not in st.session_state:
+    st.session_state.selected_alt_line=None
+
+st.subheader("Choose a prop category")
+category_columns=st.columns(4)
+for column, label in zip(category_columns, LINES):
+    with column:
+        if st.button(label, key=f"category_{label}", use_container_width=True,
+                     type="primary" if st.session_state.selected_category==label else "secondary"):
+            if st.session_state.selected_category!=label:
+                st.session_state.selected_category=label
+                st.session_state.selected_alt_line=None
+
+selected_category=st.session_state.selected_category
+st.markdown(f"**{selected_category} — select an alternate line**")
+line_columns=st.columns(len(LINES[selected_category][1])+1)
+with line_columns[0]:
+    if st.button("All", key="line_all", use_container_width=True,
+                 type="primary" if st.session_state.selected_alt_line is None else "secondary"):
+        st.session_state.selected_alt_line=None
+for column, threshold in zip(line_columns[1:], LINES[selected_category][1]):
+    with column:
+        if st.button(f"{threshold}+", key=f"line_{selected_category}_{threshold}",
+                     use_container_width=True,
+                     type="primary" if st.session_state.selected_alt_line==threshold else "secondary"):
+            st.session_state.selected_alt_line=threshold
+
+# Continuous hit-rate gradient: red (0%) → yellow (50%) → green (100%).
+def hit_color(rate):
+    rate=max(0.0,min(1.0,float(rate)))
+    red=(220,53,69)
+    yellow=(255,214,64)
+    green=(34,170,95)
+    low,high,t=(red,yellow,rate*2) if rate<=0.5 else (yellow,green,(rate-0.5)*2)
+    return "#" + "".join(f"{round(a+(b-a)*t):02x}" for a,b in zip(low,high))
+
+def hit_cell_style(text):
+    try:
+        numerator,denominator=text.split(" ",1)[0].split("/")
+        ratio=int(numerator)/int(denominator)
+        if int(denominator)==0:return ""
+        return f"background-color: {hit_color(ratio)}; color: #151515; font-weight: 650;"
+    except (ValueError,ZeroDivisionError,AttributeError):
+        return ""
+
+st.header("🏀 Today's Full-Slate Alternate Hit Rates")
+st.caption("All players with a recorded game for a team on the selected slate, not a confirmed active roster. Last 10 completed regular-season games; previous season included when needed. Every threshold appears as hits/games (percent).")
 @st.cache_data(ttl=3600,show_spinner=False)
-def all_current_players(season):
-    return season_players(season)
-def generate_board(day, opponents):
-    pool=all_current_players(season_for(day))
-    if pool.empty:return pd.DataFrame()
-    pool=pool[pool["TEAM_ABBREVIATION"].isin(opponents)].sort_values("GAME_DATE",ascending=False).drop_duplicates("PLAYER_ID")
-    results=[]
-    progress=st.progress(0,text="Loading player histories...")
-    for i,(_,r) in enumerate(pool.iterrows()):
-        progress.progress((i+1)/len(pool),text=f"Checking {i+1}/{len(pool)} players")
-        pid=int(r["PLAYER_ID"])
-        team_abbr=r["TEAM_ABBREVIATION"]
-        try:
-            d=logs(pid,day,minimum=10)
-            d=d.head(10)
-            if len(d)<5:continue
-            for category,(col,thresholds) in LINES.items():
-                for line in thresholds:
-                    hits=int((d[col]>=line).sum())
-                    results.append({"Category":category,"Player":r["PLAYER_NAME"],
-                                    "Team":team_abbr,"Opponent":opponents[team_abbr],
-                                    "Alternate":f"{line}+","Line value":line,
-                                    "Hits":hits,"Games":len(d),"Hit rate":hits/len(d),
-                                    "Last 10 average":round(float(d[col].mean()),1),
-                                    "Availability":"⚠️ UNVERIFIED"})
-        except Exception:
-            continue
-    progress.empty()
-    return pd.DataFrame(results)
-if st.button("🔄 Calculate today's Top 10 boards",type="primary"):
-    with st.spinner("Calculating actual game-log hit rates for today's teams..."):
-        st.session_state["board_data"]=generate_board(day,opponents)
-        st.session_state["board_date"]=str(day)
-board=st.session_state.get("board_data",pd.DataFrame())
-if st.session_state.get("board_date")!=str(day):
+def full_slate_logs(day):
+    seasons=previous_seasons(day,2)
+    frames=[]
+    for season in seasons:
+        frame=normalize(season_players(season),season)
+        if not frame.empty:
+            frames.append(frame)
+    if not frames:
+        return pd.DataFrame()
+    result=pd.concat(frames,ignore_index=True)
+    result=result[result["GAME_DATE"].dt.date<day]
+    return result.sort_values("GAME_DATE",ascending=False)
+
+def full_slate_board(day,opponents):
+    history=full_slate_logs(day)
+    if history.empty:return pd.DataFrame()
+    current=history[history["SEASON"]==season_for(day)]
+    latest=current.drop_duplicates("PLAYER_ID")
+    latest=latest[latest["TEAM_ABBREVIATION"].isin(opponents)]
+    rows=[]
+    for _,p in latest.iterrows():
+        games=history[history["PLAYER_ID"]==p["PLAYER_ID"]].head(10)
+        if games.empty:continue
+        for category,(col,thresholds) in LINES.items():
+            row={"Category":category,"Player":p["PLAYER_NAME"],"Team":p["TEAM_ABBREVIATION"],
+                 "Opponent":opponents[p["TEAM_ABBREVIATION"]],"Games":len(games),
+                 "Last 10 avg":round(float(games[col].mean()),1),"Availability":"⚠️ UNVERIFIED"}
+            for line in thresholds:
+                hits=int((games[col]>=line).sum())
+                row[f"{line}+"]=f"{hits}/{len(games)} ({hits/len(games):.0%})"
+                row[f"_hits_{line}"]=hits/len(games)
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+if st.button("🔄 Load all players and alternate hit rates",type="primary"):
+    try:
+        with st.spinner("Loading game logs for today's teams..."):
+            st.session_state["full_board"]=full_slate_board(day,opponents)
+            st.session_state["full_board_date"]=str(day)
+    except Exception as e:
+        st.error(f"Unable to retrieve complete player logs: {e}")
+board=st.session_state.get("full_board",pd.DataFrame())
+if st.session_state.get("full_board_date")!=str(day):
     board=pd.DataFrame()
 if not board.empty:
-    for cat in LINES:
-        st.subheader(f"Top 10 — {cat}")
-        subset=board[board["Category"]==cat].copy()
-        # Choose a single highest-confidence alternate for each player; break ties by harder threshold.
-        subset=subset.sort_values(["Hit rate","Games","Line value"],ascending=[False,False,False]).drop_duplicates("Player").head(10)
-        subset["Last 10 hit rate"]=subset.apply(lambda r:f"{r['Hits']}/{r['Games']} ({r['Hit rate']:.0%})",axis=1)
-        st.dataframe(subset[["Player","Team","Opponent","Alternate","Last 10 hit rate","Last 10 average","Availability"]],hide_index=True,use_container_width=True)
-elif st.session_state.get("board_date")==str(day):
-    st.warning("No complete ranking data could be retrieved. NBA Stats may be rate-limiting requests.")
+    cat=st.session_state.selected_category
+    chosen=st.session_state.selected_alt_line
+    team_filter=st.selectbox("Filter full slate by team",["All teams"]+sorted(opponents),key="full_slate_team")
+    search=st.text_input("Search full-slate players",key="full_slate_search")
+    subset=board[board["Category"]==cat].copy()
+    if team_filter!="All teams":subset=subset[subset["Team"]==team_filter]
+    if search:subset=subset[subset["Player"].str.contains(search,case=False,regex=False,na=False)]
+    thresholds=LINES[cat][1]
+    sort_line=chosen if chosen is not None else thresholds[0]
+    subset=subset.sort_values([f"_hits_{sort_line}","Last 10 avg"],ascending=False)
+    visible=["Player","Team","Opponent","Games","Last 10 avg"]+[f"{n}+" for n in thresholds]+["Availability"]
+    st.subheader(f"{cat}: {len(subset)} players"+(f" • ranked by {chosen}+" if chosen is not None else ""))
+    hit_columns=[f"{n}+" for n in thresholds]
+    styled=subset[visible].style.map(hit_cell_style,subset=hit_columns)
+    st.dataframe(styled,hide_index=True,use_container_width=True)
+    st.caption("Color scale: 🟥 0/10 (0%) → 🟨 5/10 (50%) → 🟩 10/10 (100%). In-between hit rates blend smoothly. Colors use the actual hits/games ratio when fewer than 10 games are available.")
+    st.download_button("Download this category (CSV)",subset[visible].to_csv(index=False),
+                       file_name=f"nba_{cat.lower().replace(' ','_')}_hit_rates.csv",mime="text/csv")
+    st.markdown("### 📊 Player stats and hit-rate bar graphs")
+    if not subset.empty:
+        chart_players=subset[["Player","Team"]].copy()
+        chart_players["Label"]=chart_players["Player"]+" ("+chart_players["Team"]+")"
+        chosen_player=st.selectbox("Select a player to graph",chart_players["Label"].tolist(),key="chart_player")
+        selected_row=chart_players.loc[chart_players["Label"]==chosen_player].iloc[0]
+        selected_name=selected_row["Player"]
+        selected_team=selected_row["Team"]
+        player_pool=full_slate_logs(day)
+        selected_logs=player_pool[
+            player_pool["PLAYER_ID"]==int(
+                player_pool.loc[
+                    (player_pool["PLAYER_NAME"]==selected_name)
+                    & (player_pool["TEAM_ABBREVIATION"]==selected_team),
+                    "PLAYER_ID"
+                ].iloc[0]
+            )
+        ].head(10).sort_values("GAME_DATE")
+        stat_col, alternate_thresholds=LINES[cat]
+        if not selected_logs.empty:
+            chart_data=selected_logs[["GAME_DATE","MATCHUP",stat_col]].copy()
+            chart_data["Game"]=chart_data["GAME_DATE"].dt.strftime("%b %d")+" "+chart_data["MATCHUP"]
+            chart_data=chart_data.set_index("Game")[[stat_col]].rename(columns={stat_col:cat})
+            st.markdown(f"**{selected_name} — last {len(chart_data)} games ({cat})**")
+            st.bar_chart(chart_data,use_container_width=True)
+            percentages=pd.DataFrame({
+                "Alternate":[f"{n}+" for n in alternate_thresholds],
+                "Hit rate (%)":[round(100*(selected_logs[stat_col]>=n).mean(),1) for n in alternate_thresholds]
+            }).set_index("Alternate")
+            st.markdown("**Hit rate for each alternate line**")
+            graph_data=percentages.reset_index()
+            graph_data["Color"]=graph_data["Hit rate (%)"].apply(lambda v:hit_color(v/100))
+            graph=alt.Chart(graph_data).mark_bar(cornerRadiusTopLeft=3,cornerRadiusTopRight=3).encode(
+                x=alt.X("Alternate:N",sort=[f"{n}+" for n in alternate_thresholds],title="Alternate line"),
+                y=alt.Y("Hit rate (%):Q",scale=alt.Scale(domain=[0,100]),title="Last-10 hit rate (%)"),
+                color=alt.Color("Color:N",scale=None,legend=None),
+                tooltip=["Alternate:N",alt.Tooltip("Hit rate (%):Q",format=".1f")]
+            ).properties(height=260)
+            st.altair_chart(graph,use_container_width=True)
+            st.caption("Each game bar is the actual stat total. Hit-rate bars show the percentage of the available last 10 games reaching each alternate.")
+
+    st.caption("An absent player is not confirmed out. All availability flags remain unverified; check official injury reports and lineups. Historical hit rates are not future probabilities.")
+elif st.session_state.get("full_board_date")==str(day):
+    st.warning("No players could be loaded for this slate. The data service may be unavailable or the selected season has no logged games.")
 else:
-    st.info("Select 'Calculate today's Top 10 boards' to load the full slate. The app does not substitute unverified picks when data is missing.")
+    st.info("Click 'Load all players and alternate hit rates' to populate the full-slate table.")
 
 team_names=sorted(opponents)
 team=st.selectbox("Team playing on selected date",team_names,format_func=lambda t:f"{t} — {TEAM_MAP.get(t,{}).get('full_name',t)}")
@@ -176,7 +286,7 @@ player=st.selectbox("Player",names["PLAYER_NAME"].tolist())
 pid=int(names.loc[names["PLAYER_NAME"]==player,"PLAYER_ID"].iloc[0])
 st.image(f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png",width=160)
 st.warning("⚠️ UNVERIFIED availability — this app does not confirm today's injury report, lineup, or active status. A historical game log does not mean a player is available.")
-category=st.selectbox("Prop category",list(LINES))
+category=st.selectbox("Prop category",list(LINES),index=list(LINES).index(st.session_state.selected_category))
 with st.spinner("Loading historical game logs..."):
     all_logs=logs(pid,day,minimum=10)
     vs_logs=logs(pid,day,minimum=10,vs_team=opponent)
